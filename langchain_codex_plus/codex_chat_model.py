@@ -98,6 +98,7 @@ from langchain_codex_plus.codex_auth import (
 from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
     CodexResponseError,
+    terminal_event_error,
     SseEvent,
     ToolCallAssembler,
     ToolCallFragment,
@@ -126,7 +127,7 @@ logger = logging.getLogger(__name__)
 #: ``@openai/codex`` CLI version in deployments. Set
 #: ``CODEX_PLUS_CLIENT_VERSION`` to present a newer version without a release
 #: when the backend raises the floor again.
-_CODEX_CLIENT_VERSION = "0.159.1"
+_CODEX_CLIENT_VERSION = "0.167.1"
 
 _CLIENT_VERSION_ENV = "CODEX_PLUS_CLIENT_VERSION"
 
@@ -405,7 +406,9 @@ class ChatCodexPlus(BaseChatModel):
         :class:`CodexAuthRefreshError` on failure — permanent failures
         (expired/reused refresh_token) require ``codex login``."""
         new_auth = refresh_codex_auth_coordinated(
-            self._resolve_auth(), path=self.auth_file_path
+            self._resolve_auth(),
+            path=self.auth_file_path,
+            refresh_reason="unauthorized_recovery",
         )
         self._auth = new_auth
         return new_auth
@@ -413,7 +416,9 @@ class ChatCodexPlus(BaseChatModel):
     async def _refresh_auth_async(self) -> CodexAuth:
         """Async sibling of :meth:`_refresh_auth_sync`."""
         new_auth = await arefresh_codex_auth_coordinated(
-            self._resolve_auth(), path=self.auth_file_path
+            self._resolve_auth(),
+            path=self.auth_file_path,
+            refresh_reason="unauthorized_recovery",
         )
         self._auth = new_auth
         return new_auth
@@ -952,27 +957,8 @@ class ChatCodexPlus(BaseChatModel):
                                 resp.get("usage"), dict
                             ) else None
                             response_id = resp.get("id") or response_id
-                    elif ev.event in {"response.error", "error"}:
-                        err = ev.data.get("error") or ev.data
-                        raise CodexResponseError(
-                            message=(
-                                err.get("message")
-                                if isinstance(err, dict)
-                                else str(err)
-                            )
-                            or "Codex returned an error mid-stream",
-                            code=(
-                                err.get("code")
-                                if isinstance(err, dict)
-                                else None
-                            ),
-                            type=(
-                                err.get("type")
-                                if isinstance(err, dict)
-                                else None
-                            ),
-                            raw=ev.data,
-                        )
+                    elif (terminal_error := terminal_event_error(ev)) is not None:
+                        raise terminal_error
                 # Natural completion: flush any held-back text (we'd
                 # buffered it in case it was a stop prefix; the stream
                 # ended without ever matching). Then emit the usage
@@ -1171,19 +1157,8 @@ def _yield_chunks_sync(
                     resp.get("usage"), dict
                 ) else None
                 response_id = resp.get("id") or response_id
-        elif ev.event in {"response.error", "error"}:
-            err = ev.data.get("error") or ev.data
-            raise CodexResponseError(
-                message=(
-                    err.get("message")
-                    if isinstance(err, dict)
-                    else str(err)
-                )
-                or "Codex returned an error mid-stream",
-                code=err.get("code") if isinstance(err, dict) else None,
-                type=err.get("type") if isinstance(err, dict) else None,
-                raw=ev.data,
-            )
+        elif (terminal_error := terminal_event_error(ev)) is not None:
+            raise terminal_error
     # Natural completion: flush any text held back for stop-matching
     # before emitting the terminal usage chunk. If we reach here with
     # ``hold_buffer`` non-empty, the stream completed without ever

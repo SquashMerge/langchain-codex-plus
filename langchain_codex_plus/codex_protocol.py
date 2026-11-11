@@ -57,7 +57,7 @@ def _message_to_input_entries(message: Any) -> list[dict[str, Any]]:
     tool calls (Codex represents each ``tool_call`` as its own
     top-level ``function_call`` entry, not nested under the assistant
     message). SystemMessage returns an empty list — it's folded into
-    ``instructions`` separately.
+    the leading developer instructions entry separately.
     """
     role = getattr(message, "type", None)
     if role == "system":
@@ -451,9 +451,18 @@ def build_request_body(
 ) -> dict[str, Any]:
     """Build the JSON body for ``POST /codex/responses``.
 
-    Always sets ``stream: true`` (Codex requires it). ``instructions``
-    comes from ``instructions_override`` if provided, else from
+    Always sets ``stream: true`` (Codex requires it). The instructions
+    come from ``instructions_override`` if provided, else from
     SystemMessages in ``messages``.
+
+    Instructions are sent the way Codex CLI 0.167 sends them: as a leading
+    ``developer`` message in ``input``, not as a top-level ``instructions``
+    field. Codex dropped the top-level field between 0.159 and 0.167 and
+    prepends the base instructions to ``input`` instead.
+
+    Field order follows Codex's ``ResponsesApiRequest``: ``model``,
+    ``stream`` and ``service_tier`` come first, because gateways may route
+    on the start of the body before reading a large ``input``.
 
     ``tools`` shape (Responses API):
         ``[{"type": "function", "name": "...", "description": "...",
@@ -479,24 +488,33 @@ def build_request_body(
         else _extract_instructions(messages_list)
     )
     input_entries: list[dict[str, Any]] = []
+    if instructions:
+        input_entries.append(_developer_instructions_entry(instructions))
     for m in messages_list:
         input_entries.extend(_message_to_input_entries(m))
-    body: dict[str, Any] = {
-        "model": model,
-        "instructions": instructions,
-        "input": input_entries,
-        "stream": True,
-        "store": store,
-    }
-    if reasoning_effort is not None:
-        body["reasoning"] = {"effort": reasoning_effort}
+    extra = dict(extra or {})
+    body: dict[str, Any] = {"model": model, "stream": True}
+    if "service_tier" in extra:
+        body["service_tier"] = extra.pop("service_tier")
+    body["input"] = input_entries
     if tools:
         body["tools"] = list(tools)
     if tool_choice is not None:
         body["tool_choice"] = tool_choice
-    if extra:
-        body.update(extra)
+    if reasoning_effort is not None:
+        body["reasoning"] = {"effort": reasoning_effort}
+    body["store"] = store
+    body.update(extra)
     return body
+
+
+def _developer_instructions_entry(instructions: str) -> dict[str, Any]:
+    """The base-instructions item Codex CLI 0.167 prepends to ``input``."""
+    return {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": instructions}],
+    }
 
 
 # ─── SSE parsing ────────────────────────────────────────────────────────
@@ -978,17 +996,8 @@ def consume_events(
             if isinstance(resp, dict):
                 completed_response = resp
                 response_id = resp.get("id") or response_id
-        elif evt.event == "response.error" or evt.event == "error":
-            err = evt.data.get("error") or evt.data
-            raise CodexResponseError(
-                message=(
-                    err.get("message") if isinstance(err, dict) else str(err)
-                )
-                or "Codex returned an error mid-stream",
-                code=err.get("code") if isinstance(err, dict) else None,
-                type=err.get("type") if isinstance(err, dict) else None,
-                raw=evt.data,
-            )
+        elif (terminal_error := terminal_event_error(evt)) is not None:
+            raise terminal_error
 
     # Early-stop path: client-side stop sequence matched. Return a
     # synthesized completion. ``raw_response`` carries an explicit
@@ -1102,6 +1111,45 @@ class CodexResponseError(RuntimeError):
             bits.append(f"request_summary={self.request_summary!r}")
         return f"CodexResponseError({', '.join(bits)})"
 
+
+def terminal_event_error(event: SseEvent) -> "CodexResponseError | None":
+    """Map a terminal failure event to the error to raise, else ``None``.
+
+    Covers ``response.error`` / ``error`` and also ``response.failed`` and
+    ``response.incomplete``, which Codex CLI treats as errors. 0.167 reports
+    an incomplete response with its reason (``content_filter``,
+    ``max_output_tokens``), so a truncated answer is never mistaken for a
+    complete one.
+    """
+    data = event.data if isinstance(event.data, dict) else {}
+    if event.event in {"response.error", "error"}:
+        err = data.get("error") or data
+        return CodexResponseError(
+            message=(err.get("message") if isinstance(err, dict) else str(err))
+            or "Codex returned an error mid-stream",
+            code=err.get("code") if isinstance(err, dict) else None,
+            type=err.get("type") if isinstance(err, dict) else None,
+            raw=data,
+        )
+    response = data.get("response") if isinstance(data.get("response"), dict) else {}
+    if event.event == "response.failed":
+        err = response.get("error") if isinstance(response.get("error"), dict) else {}
+        return CodexResponseError(
+            message=err.get("message") or "Codex reported the response as failed",
+            code=err.get("code"),
+            type=err.get("type") or "response_failed",
+            raw=data,
+        )
+    if event.event == "response.incomplete":
+        details = response.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else None
+        return CodexResponseError(
+            message=f"Codex returned an incomplete response (reason: {reason or 'unknown'})",
+            code=reason,
+            type="response_incomplete",
+            raw=data,
+        )
+    return None
 
 def parse_error_body(body_bytes: bytes) -> CodexResponseError:
     """Parse the JSON body returned with a non-2xx HTTP envelope.

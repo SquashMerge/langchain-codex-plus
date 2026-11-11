@@ -140,12 +140,13 @@ def test_build_body_routes_through_protocol(auth_file):
         HumanMessage("hi"),
     ])
     assert body["model"] == "gpt-5.4"
-    assert body["instructions"] == "be terse"
+    assert "instructions" not in body
     assert body["reasoning"] == {"effort": "low"}
     assert body["stream"] is True
     assert body["store"] is True
     assert body["input"] == [
-        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": 'be terse'}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
     ]
 
 
@@ -154,7 +155,8 @@ def test_build_body_explicit_instructions_field_overrides(auth_file):
         auth_file_path=auth_file, instructions="OVERRIDE"
     )
     body = llm._build_body([SystemMessage("ignored"), HumanMessage("hi")])
-    assert body["instructions"] == "OVERRIDE"
+    assert body["input"][0] == {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": 'OVERRIDE'}]}
+    assert all("ignored" not in str(entry) for entry in body["input"])
 
 
 def test_request_url_includes_client_version(auth_file):
@@ -216,16 +218,18 @@ def test_generate_request_body_is_what_codex_expects(auth_file):
     body = json.loads(transport.last_request.content)
     assert body == {
         "model": "gpt-5.4",
-        "instructions": "",
+        "stream": True,
         "input": [
             {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "hi"}],
             }
         ],
-        "stream": True,
         "store": False,
     }
+    # Codex 0.167 serializes routing fields first so gateways can read
+    # them before a large input; the wire order is part of the contract.
+    assert list(body)[:3] == ["model", "stream", "input"]
 
 
 def test_explicit_reasoning_effort_is_sent_verbatim(auth_file):
@@ -242,8 +246,8 @@ def test_explicit_reasoning_effort_is_sent_verbatim(auth_file):
 def test_default_client_version_and_user_agent(auth_file, monkeypatch):
     monkeypatch.delenv("CODEX_PLUS_CLIENT_VERSION", raising=False)
     llm = ChatCodexPlus(auth_file_path=auth_file)
-    assert llm.client_version == "0.159.1"
-    assert llm.user_agent == "codex_cli_rs/0.159.1"
+    assert llm.client_version == "0.167.1"
+    assert llm.user_agent == "codex_cli_rs/0.167.1"
 
 
 def test_client_version_env_overrides_default(auth_file, monkeypatch):
@@ -260,7 +264,7 @@ def test_client_version_env_overrides_default(auth_file, monkeypatch):
 def test_blank_client_version_env_uses_default(auth_file, monkeypatch):
     monkeypatch.setenv("CODEX_PLUS_CLIENT_VERSION", "   ")
     llm = ChatCodexPlus(auth_file_path=auth_file)
-    assert llm.client_version == "0.159.1"
+    assert llm.client_version == "0.167.1"
 
 
 def test_generate_invokes_rate_limit_callback(auth_file):

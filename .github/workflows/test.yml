@@ -1,0 +1,26 @@
+name: Tests
+
+# Runs the suite against the committed lock on every push to the default branch
+# and on every pull request. uv sync --locked fails if uv.lock is stale.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install ${{ matrix.python-version }}
+      - run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
+      - run: uv run --locked --all-extras pytest -q tests

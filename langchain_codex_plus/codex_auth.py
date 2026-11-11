@@ -127,6 +127,15 @@ class CodexAuth:
     expiry heuristic (Codex's access tokens have ~1h TTL in practice;
     treat anything older than 55min as suspect)."""
 
+    oauth_issuer: str | None = None
+    """OAuth authority recorded at login (``tokens.oauth_provenance.issuer``,
+    written by Codex CLI 0.167+). When present, refresh goes to
+    ``<issuer>/oauth/token``. Older auth files have none."""
+
+    oauth_client_id: str | None = None
+    """Client id recorded with :attr:`oauth_issuer`; replaces the default
+    Codex client id for refresh when present."""
+
 
 def codex_home() -> Path:
     """Return ``$CODEX_HOME`` or ``~/.codex``. Mirrors codex CLI."""
@@ -196,7 +205,20 @@ def load_codex_auth(
         refresh_token=tokens.get("refresh_token"),
         account_id=tokens.get("account_id"),
         last_refresh=last_refresh,
+        **_oauth_provenance(tokens),
     )
+
+
+def _oauth_provenance(tokens: dict) -> dict[str, str]:
+    """Read ``tokens.oauth_provenance`` only when both fields are strings.
+    A partial record is ignored; Codex never infers the authority either."""
+    prov = tokens.get("oauth_provenance")
+    if not isinstance(prov, dict):
+        return {}
+    issuer, client_id = prov.get("issuer"), prov.get("client_id")
+    if isinstance(issuer, str) and issuer and isinstance(client_id, str) and client_id:
+        return {"oauth_issuer": issuer, "oauth_client_id": client_id}
+    return {}
 
 
 def is_likely_expired(
@@ -217,16 +239,38 @@ def is_likely_expired(
 # ─── Refresh ────────────────────────────────────────────────────────────
 
 
-def _refresh_endpoint() -> str:
-    return os.environ.get(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR) or REFRESH_TOKEN_URL
+def _refresh_endpoint(auth: CodexAuth | None = None) -> str:
+    """Override env var first, then the recorded issuer, then the default."""
+    override = os.environ.get(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
+    if override:
+        return override
+    if auth is not None and auth.oauth_issuer:
+        return f"{auth.oauth_issuer.rstrip('/')}/oauth/token"
+    return REFRESH_TOKEN_URL
 
 
-def _refresh_body(refresh_token: str) -> dict[str, str]:
-    return {
-        "client_id": CODEX_OAUTH_CLIENT_ID,
+REFRESH_REASONS = frozenset(
+    {"proactive_expiry", "scheduled", "unauthorized_recovery", "forced"}
+)
+"""Values Codex CLI 0.167 sends as ``refresh_reason`` (diagnostics only)."""
+
+
+def _refresh_body(
+    refresh_token: str,
+    *,
+    client_id: str | None = None,
+    refresh_reason: str | None = None,
+) -> dict[str, str]:
+    body = {
+        "client_id": client_id or CODEX_OAUTH_CLIENT_ID,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
+    if refresh_reason is not None:
+        if refresh_reason not in REFRESH_REASONS:
+            raise ValueError(f"unknown refresh_reason: {refresh_reason!r}")
+        body["refresh_reason"] = refresh_reason
+    return body
 
 
 def _apply_refresh_response(
@@ -348,6 +392,7 @@ def refresh_codex_auth(
     write_back: bool = True,
     timeout_seconds: float = 30.0,
     http_client: httpx.Client | None = None,
+    refresh_reason: str | None = None,
 ) -> CodexAuth:
     """POST to the OAuth token endpoint to refresh ``auth``.
 
@@ -366,8 +411,12 @@ def refresh_codex_auth(
             "`codex login` to authenticate.",
             permanent=True,
         )
-    endpoint = _refresh_endpoint()
-    body = _refresh_body(auth.refresh_token)
+    endpoint = _refresh_endpoint(auth)
+    body = _refresh_body(
+        auth.refresh_token,
+        client_id=auth.oauth_client_id,
+        refresh_reason=refresh_reason,
+    )
     if http_client is None:
         with httpx.Client(timeout=timeout_seconds) as client:
             response = _do_refresh_sync(client, endpoint, body)
@@ -386,6 +435,7 @@ async def arefresh_codex_auth(
     write_back: bool = True,
     timeout_seconds: float = 30.0,
     http_client: httpx.AsyncClient | None = None,
+    refresh_reason: str | None = None,
 ) -> CodexAuth:
     """Async sibling of :func:`refresh_codex_auth`. Same contract."""
     if not auth.refresh_token:
@@ -394,8 +444,12 @@ async def arefresh_codex_auth(
             "`codex login` to authenticate.",
             permanent=True,
         )
-    endpoint = _refresh_endpoint()
-    body = _refresh_body(auth.refresh_token)
+    endpoint = _refresh_endpoint(auth)
+    body = _refresh_body(
+        auth.refresh_token,
+        client_id=auth.oauth_client_id,
+        refresh_reason=refresh_reason,
+    )
     if http_client is None:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await _do_refresh_async(client, endpoint, body)
@@ -498,6 +552,7 @@ def refresh_codex_auth_coordinated(
     path: Path | None = None,
     timeout_seconds: float = 30.0,
     http_client: httpx.Client | None = None,
+    refresh_reason: str | None = None,
 ) -> CodexAuth:
     """Replace ``stale`` (an auth the server just rejected) with a
     working one without ever presenting a spent refresh token.
@@ -521,6 +576,7 @@ def refresh_codex_auth_coordinated(
                 path=p,
                 timeout_seconds=timeout_seconds,
                 http_client=http_client,
+                refresh_reason=refresh_reason,
             )
         except CodexAuthRefreshError:
             rotated = _rotated_on_disk(current, p)
@@ -535,6 +591,7 @@ async def arefresh_codex_auth_coordinated(
     path: Path | None = None,
     timeout_seconds: float = 30.0,
     http_client: httpx.AsyncClient | None = None,
+    refresh_reason: str | None = None,
 ) -> CodexAuth:
     """Async sibling of :func:`refresh_codex_auth_coordinated`."""
     p = path or auth_file_path()
@@ -549,6 +606,7 @@ async def arefresh_codex_auth_coordinated(
                 path=p,
                 timeout_seconds=timeout_seconds,
                 http_client=http_client,
+                refresh_reason=refresh_reason,
             )
         except CodexAuthRefreshError:
             rotated = _rotated_on_disk(current, p)

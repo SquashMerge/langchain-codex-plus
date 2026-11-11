@@ -121,10 +121,22 @@ server-side per model, e.g. gpt-5.4 takes `none|low|medium|high|xhigh`,
 gpt-6-astra and gpt-6-sol take `low|medium|high|xhigh|max|ultra`, and the luna
 models take `low|medium|high|xhigh|max` (no `none`).
 
-The package presents itself as Codex CLI `0.159.1`, which the backend uses to
+The package presents itself as Codex CLI `0.167.1`, which the backend uses to
 gate newer models (for example, `gpt-6.1-sol` is only listed for clients
 `>= 0.159.0`). Set `CODEX_PLUS_CLIENT_VERSION` to present a newer version
 without waiting for a release; an explicit `client_version=` argument wins.
+
+Requests match what that Codex version sends:
+
+- **Instructions:** system messages travel as a leading `developer` message in
+  `input`. There's no top-level `instructions` field.
+- **Field order:** `model`, `stream` and `service_tier` come first in the body.
+- **Errors:** `response.failed` and `response.incomplete` raise
+  `CodexResponseError`. An incomplete response carries its reason in `.code`,
+  for example `content_filter` or `max_output_tokens`.
+- **Token refresh:** when `auth.json` records `tokens.oauth_provenance`,
+  refresh uses that issuer and client id. Refreshing after a 401 reports
+  `refresh_reason: unauthorized_recovery`.
 
 ## Sharing auth.json with other consumers
 

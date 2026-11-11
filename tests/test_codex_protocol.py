@@ -33,24 +33,28 @@ def test_build_body_user_only():
     assert body["model"] == "gpt-5.4"
     assert body["stream"] is True
     assert body["store"] is False
-    assert body["instructions"] == ""
+    # Codex CLI 0.167 has no top-level instructions field; with no system
+    # prompt there is no leading developer entry either.
+    assert "instructions" not in body
     assert "reasoning" not in body
     assert body["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
     ]
 
 
-def test_build_body_system_folds_into_instructions():
-    """SystemMessage doesn't go in input — it's the ``instructions``
-    field, mirroring how Codex CLI sends it."""
+def test_build_body_system_becomes_leading_developer_entry():
+    """SystemMessage is sent the way Codex CLI 0.167 sends base
+    instructions: a leading ``developer`` message in ``input``, with no
+    top-level ``instructions`` field."""
     body = build_request_body(
         [SystemMessage("be concise"), HumanMessage("hello")],
         model="gpt-5.4",
     )
-    assert body["instructions"] == "be concise"
-    # Only the human message survived into input.
-    assert len(body["input"]) == 1
-    assert body["input"][0]["role"] == "user"
+    assert "instructions" not in body
+    assert body["input"] == [
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": 'be concise'}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    ]
 
 
 def test_build_body_multiple_system_messages_concat():
@@ -64,7 +68,8 @@ def test_build_body_multiple_system_messages_concat():
         ],
         model="gpt-5.4",
     )
-    assert body["instructions"] == "rule 1\n\nrule 2"
+    assert body["input"][0] == {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": 'rule 1\n\nrule 2'}]}
+    assert len(body["input"]) == 2
 
 
 def test_build_body_explicit_instructions_override_wins():
@@ -75,7 +80,8 @@ def test_build_body_explicit_instructions_override_wins():
         model="gpt-5.4",
         instructions_override="use this instead",
     )
-    assert body["instructions"] == "use this instead"
+    assert body["input"][0] == {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": 'use this instead'}]}
+    assert all("ignored" not in str(entry) for entry in body["input"])
 
 
 def test_build_body_assistant_message_uses_output_text():

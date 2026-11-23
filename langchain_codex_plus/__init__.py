@@ -44,7 +44,7 @@ from langchain_codex_plus.rate_limits import (
     parse_codex_rate_limits,
 )
 
-__version__ = "0.0.14"
+__version__ = "0.1.0"
 
 __all__ = [
     # codex_auth

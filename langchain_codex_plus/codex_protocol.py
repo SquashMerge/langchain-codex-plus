@@ -33,8 +33,10 @@ body when the HTTP envelope is non-200; both shapes carry
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -455,7 +457,7 @@ def build_request_body(
     come from ``instructions_override`` if provided, else from
     SystemMessages in ``messages``.
 
-    Instructions are sent the way Codex CLI 0.167 sends them: as a leading
+    Instructions are sent the way Codex CLI 0.167 and later send them: as a leading
     ``developer`` message in ``input``, not as a top-level ``instructions``
     field. Codex dropped the top-level field between 0.159 and 0.167 and
     prepends the base instructions to ``input`` instead.
@@ -509,7 +511,7 @@ def build_request_body(
 
 
 def _developer_instructions_entry(instructions: str) -> dict[str, Any]:
-    """The base-instructions item Codex CLI 0.167 prepends to ``input``."""
+    """The base-instructions item Codex CLI (0.167+) prepends to ``input``."""
     return {
         "type": "message",
         "role": "developer",
@@ -1116,10 +1118,13 @@ def terminal_event_error(event: SseEvent) -> "CodexResponseError | None":
     """Map a terminal failure event to the error to raise, else ``None``.
 
     Covers ``response.error`` / ``error`` and also ``response.failed`` and
-    ``response.incomplete``, which Codex CLI treats as errors. 0.167 reports
-    an incomplete response with its reason (``content_filter``,
-    ``max_output_tokens``), so a truncated answer is never mistaken for a
-    complete one.
+    ``response.incomplete``, which Codex CLI treats as errors. The first such
+    event ends the stream, even if a ``response.completed`` follows; Codex CLI
+    0.171 also ends the stream on terminal provider codes such as
+    ``context_length_exceeded``, ``content_policy_violation`` and
+    ``budget_reached``. Codex reports an incomplete response with its
+    reason (``content_filter``, ``max_output_tokens``), so a truncated
+    answer is never mistaken for a complete one.
     """
     data = event.data if isinstance(event.data, dict) else {}
     if event.event in {"response.error", "error"}:
@@ -1151,42 +1156,94 @@ def terminal_event_error(event: SseEvent) -> "CodexResponseError | None":
         )
     return None
 
-def parse_error_body(body_bytes: bytes) -> CodexResponseError:
+
+X_ERROR_JSON_HEADER = "x-error-json"
+"""Header carrying a base64 JSON ``{"error": {"code": ...}}`` on identity
+errors. Codex CLI 0.171 falls back to its code when the body has none."""
+
+
+def error_code_from_x_error_json(headers: Mapping[str, str] | None) -> str | None:
+    """Return ``error.code`` from a base64 ``x-error-json`` header, else None."""
+    if not headers:
+        return None
+    encoded = None
+    for name, value in headers.items():
+        if name.lower() == X_ERROR_JSON_HEADER:
+            encoded = value
+            break
+    if not encoded:
+        return None
+    try:
+        parsed = json.loads(base64.b64decode(encoded.strip(), validate=True))
+    except (binascii.Error, ValueError):
+        return None
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def parse_error_body(
+    body_bytes: bytes, headers: Mapping[str, str] | None = None
+) -> CodexResponseError:
     """Parse the JSON body returned with a non-2xx HTTP envelope.
 
-    Codex's two error shapes:
+    Codex's error shapes:
 
     1. ``{"detail": "Some message"}`` — short validator errors.
-    2. ``{"error": {"message": ..., "type": ..., "code": ...}}`` —
+    2. ``{"detail": {"code": ..., "message": ...}}`` — structured detail.
+    3. ``{"error": {"message": ..., "type": ..., "code": ...}}`` —
        OpenAI-style structured errors.
 
-    Returns a :class:`CodexResponseError` either way.
+    The code is read the way Codex CLI 0.171 reads it: ``detail.code``,
+    then ``error.code``, then the ``x-error-json`` header when the body
+    carries no code. Returns a :class:`CodexResponseError` either way.
     """
+    header_code = error_code_from_x_error_json(headers)
     try:
         parsed = json.loads(body_bytes.decode("utf-8", errors="replace"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         return CodexResponseError(
             message=body_bytes.decode("utf-8", errors="replace")[:500]
             or "<empty response body>",
+            code=header_code,
             raw=body_bytes,
         )
     if not isinstance(parsed, dict):
-        return CodexResponseError(message=str(parsed)[:500], raw=parsed)
-    if "error" in parsed and isinstance(parsed["error"], dict):
-        err = parsed["error"]
+        return CodexResponseError(
+            message=str(parsed)[:500], code=header_code, raw=parsed
+        )
+    detail = parsed.get("detail")
+    err = parsed.get("error")
+    detail_code = detail.get("code") if isinstance(detail, dict) else None
+    error_code = err.get("code") if isinstance(err, dict) else None
+    code = next(
+        (c for c in (detail_code, error_code) if isinstance(c, str)), header_code
+    )
+    if isinstance(err, dict):
         return CodexResponseError(
             message=str(err.get("message") or "Codex error"),
-            code=err.get("code"),
+            code=code,
             type=err.get("type"),
+            raw=parsed,
+        )
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        return CodexResponseError(
+            message=str(message) if isinstance(message, str) and message.strip()
+            else json.dumps(detail)[:500],
+            code=code,
+            type="validation_error",
             raw=parsed,
         )
     if "detail" in parsed:
         return CodexResponseError(
-            message=str(parsed["detail"]),
+            message=str(detail),
+            code=code,
             type="validation_error",
             raw=parsed,
         )
     return CodexResponseError(
         message=json.dumps(parsed)[:500],
+        code=code,
         raw=parsed,
     )

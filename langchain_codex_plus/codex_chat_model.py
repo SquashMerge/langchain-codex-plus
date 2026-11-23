@@ -127,7 +127,7 @@ logger = logging.getLogger(__name__)
 #: ``@openai/codex`` CLI version in deployments. Set
 #: ``CODEX_PLUS_CLIENT_VERSION`` to present a newer version without a release
 #: when the backend raises the floor again.
-_CODEX_CLIENT_VERSION = "0.167.1"
+_CODEX_CLIENT_VERSION = "0.171.0"
 
 _CLIENT_VERSION_ENV = "CODEX_PLUS_CLIENT_VERSION"
 
@@ -630,7 +630,7 @@ class ChatCodexPlus(BaseChatModel):
         if 200 <= response.status_code < 300:
             return
         body_bytes = response.read()
-        err = parse_error_body(body_bytes)
+        err = parse_error_body(body_bytes, response.headers)
         # Surface the rate-limit headers on errors too (esp. 429): fire
         # the callback so the usage snapshot updates even on a refusal,
         # and attach status_code + headers + parsed limits to the
@@ -779,7 +779,7 @@ class ChatCodexPlus(BaseChatModel):
         if 200 <= response.status_code < 300:
             return
         body_bytes = await response.aread()
-        err = parse_error_body(body_bytes)
+        err = parse_error_body(body_bytes, response.headers)
         # See _raise_for_http_error: surface rate-limit headers on errors
         # so a 429 carries its reset timestamp instead of being opaque.
         rate_limits = self._fire_rate_limit_callback(response.headers)

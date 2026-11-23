@@ -252,7 +252,7 @@ def _refresh_endpoint(auth: CodexAuth | None = None) -> str:
 REFRESH_REASONS = frozenset(
     {"proactive_expiry", "scheduled", "unauthorized_recovery", "forced"}
 )
-"""Values Codex CLI 0.167 sends as ``refresh_reason`` (diagnostics only)."""
+"""Values Codex CLI (0.167-0.171) sends as ``refresh_reason`` (diagnostics only)."""
 
 
 def _refresh_body(
